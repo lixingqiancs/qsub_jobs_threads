@@ -1,8 +1,9 @@
 #!/bin/sh
 
-dir=$(dirname $(which qsub_jobs_threads))  # dirname of qsub_jobs_threads.py
+#dir=$(dirname $(which qsub_jobs_threads))  # dirname of qsub_jobs_threads.py
+dir='/lustre/zhouze/Software/qsub_jobs_threads'
 
-if [[ $# < 2 ]]; then
+if [[ $# < 3 ]]; then
 	python3 $dir/qsub_jobs_threads.py $@
 else
 	echo 'Please check details in file "log_SGE.out" and directory "log_SGE"'

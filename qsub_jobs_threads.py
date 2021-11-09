@@ -16,7 +16,7 @@ No comment (#...) is allowed in command line.
 '''
 
 __author__ = 'ZHOU Ze <dazhouze@link.cuhk.edu.hk>'
-__version__ = '2.10'
+__version__ = '2.11'
 
 import os
 import subprocess as sp
@@ -29,6 +29,7 @@ from random import shuffle as rand_shuf
 TIMEOUT = 5*60  # 5 min
 PE = 'smp'  # pe in SGE
 LOG_DIR = 'log_SGE'  # log directory
+exclude_nodes = set()
 
 class Parallel_jobs(object):
 	'''
@@ -45,6 +46,8 @@ class Parallel_jobs(object):
 			self._record_time = None  # the starting time
 			self._id = None  # the sge given id
 			self._status = None  # the sge job status
+			self._target = None
+			self._command = None
 
 		def __repr__(self):
 			return '{} {}'.format(self._sge_name, self._status)
@@ -93,10 +96,14 @@ class Parallel_jobs(object):
 					return True
 			return None  # un-finished
 
-		def submit(self, target, command, threads, queue, mem_gb, pe, log_dir, time_now):
+		def submit(self, target, command, threads, queue, pe, log_dir, time_now):
 			'''
 			Submit job.
 			'''
+			self._target = target
+			self._command = command
+			self._threads = threads
+			self._queue = queue
 			sge_name = target  # name for SGE, qsub -N
 			if '/' in target:  # path as name (target)
 				sge_name = sge_name[:-1] if sge_name[-1] == '/' else sge_name  # in case of /
@@ -110,8 +117,8 @@ class Parallel_jobs(object):
 					pe,
 					threads,
 					'' if queue is None else '-q {}'.format(' -q '.join(queue)),
-					'' if mem_gb is None else '-l vf={}G'.format(mem_gb),
-					) 
+					'' if len(exclude_nodes)==0 else "-l h='!({})'".format('|'.join(['{}'.format(n) for n in exclude_nodes])),
+					)
 			qsub_command = 'qsub {} -N "{}" -o :"{}" -e :"{}" <<E0F\n{}\nE0F'\
 					.format(sge_par,
 					sge_name,
@@ -132,12 +139,11 @@ class Parallel_jobs(object):
 			self._record_time = time_now  # the submit time
 			self._id = job_id  # the sge given id
 			self._status = 't'  # the sge job status
-			print('Job submit\tID: {}\tName: {}\tTime: {}\tCPU: {}{}{}'
+			print('Job submit\tID: {}\tName: {}\tTime: {}\tCPU: {}{}'
 					.format(self._id,
 						self._sge_name,
 						self._record_time.strftime('%Y-%m-%d %H:%M:%S'),
 						threads,
-						'\tMem: {}GB'.format(mem_gb) if mem_gb is not None else '',
 						'\tQueue: {}'.format(','.join(queue)) if queue is not None else '',
 						))
 
@@ -150,18 +156,18 @@ class Parallel_jobs(object):
 					shell=True,
 					stdout = sp.PIPE,
 					stderr = sp.PIPE)
-			print('Job {}\tID: {}\tName: {}\tTime: {}'
+			print('Job {} (killed)\tID: {}\tName: {}\tTime: {}'
 					.format(reason,
 						self._id,
 						self._sge_name,
 						time_now.strftime('%Y-%m-%d %H:%M:%S')))
+			return self._target, self._command
 
 	##### High level Parallel_jobs API #####
-	def __init__(self, n_jobs, threads, queue=None, mem_gb=None, pe='smp', log_dir='log_SGE'):
+	def __init__(self, n_jobs, threads, queue=None, pe='smp', log_dir='log_SGE'):
 		self._jobs_array = [None for n in range(n_jobs)]  # jobs array for parallel jobs
 		self._threads = threads
 		self._queue = queue
-		self._mem_gb = mem_gb
 		self._pe = pe
 		self._log_dir = log_dir
 
@@ -179,11 +185,11 @@ class Parallel_jobs(object):
 				name, command, threads = dependence_satisfied_rules.pop(0)
 				#print(name, command, threads)
 				self._jobs_array[idx] = self._Job()  # init
-				self._jobs_array[idx].submit(name,
+				self._jobs_array[idx].submit(
+						name,
 						command,
 						max(self._threads, threads),
 						self._queue,
-						self._mem_gb,
 						self._pe,
 						self._log_dir,
 						time_now)
@@ -207,7 +213,7 @@ class Parallel_jobs(object):
 
 	def check_error(self, time_now):
 		'''
-		Kill Eqw and dr jobs.
+		Kill Eqw and dr/dt jobs.
 		Return False if no error.
 		Return status(str) if error happend.
 		'''
@@ -216,7 +222,26 @@ class Parallel_jobs(object):
 			if job is None:
 				continue
 			status = job.get_status()
-			if status == 'Eqw' or status == 'dr' or status == 'dt':  # ongoing/waiting error
+			if status == 'Eqw':
+				target, command =\
+						job.kill(time_now, status)  # kill this job
+				while True:
+					node = self._qacct_prev_node(job.get_id())
+					if node is not None:
+						break
+					else:
+						sleep(sleep_time)
+				exclude_nodes.add(node)
+				# resubmit
+				self._jobs_array[idx].submit(
+						target,
+						command,
+						max(self._threads, threads),
+						self._queue,
+						self._pe,
+						self._log_dir,
+						time_now)
+			if status == 'dr' or status == 'dt':  # ongoing/waiting error
 				job.kill(time_now, status)  # kill this job
 				self._jobs_array[idx] = None  # empty the job
 				err_typ = status
@@ -325,6 +350,34 @@ class Parallel_jobs(object):
 			return None
 		exit_status = int(stdout.rstrip().split()[1])  # first is 'exit_status', sec is the number
 		return exit_status  # exit_status > 0, error
+
+	def _qacct_prev_node(self, job_id):
+		'''
+		Finished job runned node.
+		qacct -j job_id
+		'''
+		p = sp.Popen('qacct -j {} | grep qname'.format(job_id),
+				shell=True,
+				stdout = sp.PIPE,
+				stderr = sp.PIPE)
+		stdout, stderr = p.communicate()
+		stdout = stdout.decode("utf-8")
+		if stdout == '':
+			return None
+		queue = stdout.rstrip().split()[1] 
+		if stdout == '':
+			sleep(sleep_time)
+
+		p = sp.Popen('qacct -j {} | grep hostname'.format(job_id),
+				shell=True,
+				stdout = sp.PIPE,
+				stderr = sp.PIPE)
+		stdout, stderr = p.communicate()
+		stdout = stdout.decode("utf-8")
+		if stdout == '':
+			return None
+		node = stdout.rstrip().split()[1]  # first is 'hostname', sec is the node 
+		return stdout.rstrip().split()[1]
 
 class Makefile(object):
 	'''
@@ -465,7 +518,6 @@ def usage():
 	result += '\t-t: INT        Number of threads(CPUs) used by each job. [1]\n'
 	result += '\t-s: INT        Time interval (s) between qstat querying. [2] seconds\n'
 	result += '\t-r:            Submit jobs in random order. (default makefile context order)\n'
-	result += '\t-m: FLOAT      Amount of GB memory uesed by each job. (default No limitation)\n'
 	result += '\t-k:            Skip error jobs and continue rest jobs. (default auto-kill rest jobs)\n'
 	result += '\t-h:            Help information.\n'
 	result += '\n\033[95mEaster Egg:\033[0m\n'
@@ -481,8 +533,8 @@ def usage():
 
 if __name__ == "__main__":
 	# get paraters
-	n_jobs, threads, make_file, queue, auto_kill, sleep_time, mem_gb, random_submit =\
-			1, 1, None, None, True, 2, None, False  # default
+	n_jobs, threads, make_file, queue, auto_kill, sleep_time, random_submit =\
+			1, 1, None, None, True, 2, False  # default
 	try:
 		opts, args = getopt.getopt(sys.argv[1:], "hkrj:t:f:q:s:m:")
 	except getopt.GetoptError:
@@ -504,8 +556,6 @@ if __name__ == "__main__":
 			queue = arg.split(',')
 		elif opt == '-s':
 			sleep_time = int(arg)
-		elif opt == '-m':
-			mem_gb = float(arg)
 
 	# parameter check
 	if len(args) > 0 or make_file is None:  # untraced paramters
@@ -524,7 +574,7 @@ if __name__ == "__main__":
 			format(datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S'),make_file,))
 	mk = Makefile(make_file)  # make file
 	tot_n_rules = mk.get_rules_num()
-	jobs = Parallel_jobs(n_jobs, threads, queue, mem_gb, pe=PE, log_dir=LOG_DIR)
+	jobs = Parallel_jobs(n_jobs, threads, queue, pe=PE, log_dir=LOG_DIR)
 	finished_jobs = set()  # store finished job name (target)
 	print('Jobs summary\ttotal:{}\tparallel run:{}'.\
 			format(tot_n_rules, n_jobs))
@@ -535,8 +585,8 @@ if __name__ == "__main__":
 		time_now = datetime.datetime.now()
 		jobs.update_all(time_now)
 
-		# if Eqw, dr, or exit status error, kill all jobs and exit the moniter program
-		if jobs.check_error(time_now) is not False:  # Eqw/dr/error
+		# if dr,dt or exit status error, kill all jobs and exit the moniter program
+		if jobs.check_error(time_now) is not False:  # dr/dt/error
 			jobs.kill_all(time_now) # kill rest of jobs
 			print('Moniter program Stopped\tTime: {}\tMakefile: {}'\
 					.format(time_now.strftime('%Y-%m-%d %H:%M:%S'), make_file))
@@ -566,6 +616,8 @@ if __name__ == "__main__":
 
 		# check if all jobs finished	
 		if jobs.is_empty():
+			if len(exclude_nodes) > 0:
+				print('Node Error:\t{}'.format(','.join(exclude_nodes)))
 			dependence_unsatisfied_rules = mk.get_remaining_rules(finished_jobs)
 			if len(dependence_unsatisfied_rules) == 0:
 				print('Jobs all finished\tTime: {}\tMakefile: {}'.\
